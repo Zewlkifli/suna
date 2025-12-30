@@ -256,6 +256,13 @@ async def log_requests_middleware(request: Request, call_next):
 allowed_origins = ["https://www.kortix.com", "https://kortix.com", "https://kortix.darwisyah.com", "https://api.kortix.darwisyah.com"]
 allow_origin_regex = None
 
+# Read additional origins from environment variable
+cors_origins_env = os.getenv("CORS_ORIGINS", "")
+if cors_origins_env:
+    custom_origins = [origin.strip() for origin in cors_origins_env.split(",")]
+    allowed_origins.extend(custom_origins)
+    logger.info(f"✅ Added custom CORS origins from env: {custom_origins}")
+
 # Add staging-specific origins
 if config.ENV_MODE == EnvMode.LOCAL:
     allowed_origins.append("http://localhost:3000")
