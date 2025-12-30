@@ -18,6 +18,8 @@ from PIL import Image
 from core.utils.logger import logger
 from core.utils.config import get_config
 from core.billing.credits.media_integration import media_billing
+from core.billing.credits.media_calculator import select_image_quality, cap_quality_for_tier, FREE_TIERS
+from core.utils.image_processing import upscale_image_sync, remove_background_sync, UPSCALE_MODEL, REMOVE_BG_MODEL
 
 
 def parse_image_paths(image_path: Optional[str | list[str]]) -> list[str]:
@@ -47,7 +49,7 @@ def parse_image_paths(image_path: Optional[str | list[str]]) -> list[str]:
 
 @tool_metadata(
     display_name="Generate Media",
-    description="Generate and edit images/videos with AI",
+    description="Generate, edit, upscale, or remove background from images. Also generates videos.",
     icon="Wand",
     color="bg-purple-100 dark:bg-purple-800/50",
     weight=50,
@@ -55,33 +57,41 @@ def parse_image_paths(image_path: Optional[str | list[str]]) -> list[str]:
     usage_guide="""
 ### IMAGE & VIDEO GENERATION
 
-**IMPORTANT:** If user uploaded an image, pass it as `image_path` to use it.
+**Actions:** generate (default), edit, upscale, remove_bg, video
 
 ```python
-# User uploaded /workspace/uploads/image.png → include image_path
+# Generate new image from prompt
+image_edit_or_generate(prompt="A futuristic city at sunset")
+
+# Edit existing image with prompt
 image_edit_or_generate(
-    prompt="Put this person on Mars with red landscape", 
+    action="edit",
+    prompt="Put this person on Mars", 
     image_path="/workspace/uploads/image.png"
 )
 
-# No upload → just prompt
-image_edit_or_generate(prompt="A futuristic city at sunset")
-
-# Video with uploaded image
+# Upscale image (no prompt needed)
 image_edit_or_generate(
-    prompt="The person turns their head",
-    image_path="/workspace/uploads/image.png",
-    video_options={"duration": 5}
+    action="upscale",
+    image_path="/workspace/uploads/photo.png"
 )
 
-# Video without image
+# Remove background (no prompt needed)
 image_edit_or_generate(
+    action="remove_bg",
+    image_path="/workspace/uploads/product.png"
+)
+
+# Generate video
+image_edit_or_generate(
+    action="video",
     prompt="An astronaut floating in space",
     video_options={"duration": 5, "generate_audio": True}
 )
 ```
 
 **video_options:** duration (2-12s), aspect_ratio ("16:9"), generate_audio (bool)
+**canvas_path:** Optionally add result to a canvas (e.g., "canvases/my-design.kanvax")
 """
 )
 class SandboxImageEditTool(SandboxToolsBase):
@@ -91,68 +101,118 @@ class SandboxImageEditTool(SandboxToolsBase):
         super().__init__(project_id, thread_manager)
         self.thread_id = thread_id
         self.thread_manager = thread_manager
+        self._tier_cache: dict = {}  # Cache tier info to avoid repeated lookups
+    
+    async def _get_user_tier(self, account_id: str) -> str:
+        """
+        Get user's subscription tier name.
+        Uses cache to avoid repeated DB lookups within the same request.
+        """
+        if account_id in self._tier_cache:
+            return self._tier_cache[account_id]
+        
+        try:
+            from core.billing.subscriptions.handlers.tier import TierHandler
+            tier_info = await TierHandler.get_user_subscription_tier(account_id)
+            tier_name = tier_info.get('name', 'none')
+            self._tier_cache[account_id] = tier_name
+            return tier_name
+        except Exception as e:
+            logger.warning(f"[IMAGE_TOOL] Failed to get tier for {account_id}: {e}, defaulting to 'none'")
+            return 'none'
+    
+    async def _get_quality_for_user(self, account_id: str) -> str:
+        """
+        Get the appropriate image quality variant based on user's tier.
+        
+        Free users: 'low' quality (cost-effective)
+        Paid users: 'medium' quality (balanced)
+        """
+        tier_name = await self._get_user_tier(account_id)
+        quality = select_image_quality(tier_name)
+        logger.info(f"[IMAGE_TOOL] Selected quality '{quality}' for tier '{tier_name}'")
+        return quality
 
     @openapi_schema(
         {
             "type": "function",
             "function": {
                 "name": "image_edit_or_generate",
-                "description": "Generate images or videos with AI. If user uploaded an image, include image_path to use it. Add video_options for video generation.",
+                "description": "Generate, edit, upscale, or remove background from images. Also supports video generation. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `prompt` (REQUIRED for generate/edit/video), `action` (optional - 'generate', 'edit', 'upscale', 'remove_bg', 'video'), `image_path` (REQUIRED for upscale/remove_bg/edit), `video_options` (optional), `canvas_path` (optional).",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["generate", "edit", "upscale", "remove_bg", "video"],
+                            "description": "**OPTIONAL** - Action to perform. 'generate' (default) = create new image from prompt. 'edit' = modify existing image with prompt. 'upscale' = enhance image resolution (no prompt needed). 'remove_bg' = remove background (no prompt needed). 'video' = generate video."
+                        },
                         "prompt": {
                             "oneOf": [
                                 {"type": "string"},
                                 {"type": "array", "items": {"type": "string"}}
                             ],
-                            "description": "Text prompt describing the desired output."
+                            "description": "**REQUIRED for generate/edit/video** - Text prompt describing the desired output. Can be a single string or array of strings for batch generation. Not needed for upscale/remove_bg."
                         },
                         "image_path": {
                             "oneOf": [
                                 {"type": "string"},
                                 {"type": "array", "items": {"type": "string"}}
                             ],
-                            "description": "Path to input image. If user uploaded an image, include that path here to use it.",
+                            "description": "**REQUIRED for upscale/remove_bg/edit** - Path to input image. Required for upscale, remove_bg, and edit actions."
                         },
                         "video_options": {
                             "type": "object",
-                            "description": "Include this to generate VIDEO instead of image. Options: {\"duration\": 5, \"aspect_ratio\": \"16:9\", \"fps\": 24, \"generate_audio\": true, \"camera_fixed\": false, \"last_frame_image\": \"path/to/end.png\"}",
+                            "description": "**OPTIONAL** - Include this to generate VIDEO instead of image. Provide an object with optional properties: duration (number, e.g., 5), aspect_ratio (string, e.g., \"16:9\"), fps (number, e.g., 24), generate_audio (boolean), camera_fixed (boolean), last_frame_image (string path)."
                         },
-                        "canvas_path": {"type": "string", "description": "Optional: Canvas file path to auto-add result."},
-                        "canvas_x": {"type": "number", "description": "Optional: X position on canvas"},
-                        "canvas_y": {"type": "number", "description": "Optional: Y position on canvas"},
+                        "canvas_path": {"type": "string", "description": "**OPTIONAL** - Canvas file path to auto-add result. Example: 'canvases/my-design.kanvax'."},
+                        "canvas_x": {"type": "number", "description": "**OPTIONAL** - X position on canvas in pixels."},
+                        "canvas_y": {"type": "number", "description": "**OPTIONAL** - Y position on canvas in pixels."}
                     },
-                    "required": ["prompt"],
+                    "required": [],
+                    "additionalProperties": False
                 },
             },
         }
     )
     async def image_edit_or_generate(
         self,
-        prompt: str | list[str],
+        prompt: Optional[str | list[str]] = None,
+        action: Optional[str] = None,
         image_path: Optional[str | list[str]] = None,
         video_options: Optional[dict] = None,
         canvas_path: Optional[str] = None,
         canvas_x: Optional[float] = None,
         canvas_y: Optional[float] = None,
     ) -> ToolResult:
-        """Generate/edit images or generate videos using AI via Replicate."""
+        """Generate/edit/upscale/remove_bg images or generate videos using AI via Replicate."""
         try:
             await self._ensure_sandbox()
             
-            # Auto-detect mode based on parameters
-            # video_options → video mode
-            # image_path → edit mode  
-            # neither → generate mode
-            if video_options is not None:
-                mode = "video"
-            elif image_path is not None:
-                mode = "edit"
+            # Determine mode from explicit action or auto-detect
+            if action:
+                mode = action.lower()
+                if mode not in ("generate", "edit", "upscale", "remove_bg", "video"):
+                    return ToolResult(success=True, output=f"Invalid action '{action}'. Use: generate, edit, upscale, remove_bg, or video.")
             else:
-                mode = "generate"
+                # Auto-detect mode based on parameters (backwards compatible)
+                # video_options → video mode
+                # image_path → edit mode  
+                # neither → generate mode
+                if video_options is not None:
+                    mode = "video"
+                elif image_path is not None:
+                    mode = "edit"
+                else:
+                    mode = "generate"
             
-            logger.info(f"Auto-detected mode: {mode} (image_path={image_path is not None}, video_options={video_options is not None})")
+            # Validate required parameters for each mode
+            if mode in ("upscale", "remove_bg") and not image_path:
+                return ToolResult(success=True, output=f"'{mode}' action requires 'image_path' parameter.")
+            if mode in ("generate", "edit", "video") and not prompt:
+                return ToolResult(success=True, output=f"'{mode}' action requires 'prompt' parameter.")
+            
+            logger.info(f"Mode: {mode} (action={action}, image_path={image_path is not None}, video_options={video_options is not None})")
             
             # Check if mock mode is enabled (for development/testing)
             use_mock = os.getenv("MOCK_IMAGE_GENERATION", "false").lower() == "true"
@@ -160,7 +220,23 @@ class SandboxImageEditTool(SandboxToolsBase):
             # BILLING: Check if user has sufficient credits before proceeding
             # Skip billing check in development/local mode
             account_id = getattr(self, '_account_id', None) or getattr(self, 'account_id', None)
+            if not account_id:
+                # Try to get from thread_manager
+                account_id = getattr(self.thread_manager, 'account_id', None)
             thread_id = getattr(self, 'thread_id', None)
+            
+            # Determine quality based on user tier
+            # Free users: 'low', Paid users: 'medium'
+            quality_variant = "medium"  # Default
+            user_tier = "none"
+            if account_id and not use_mock:
+                user_tier = await self._get_user_tier(account_id)
+                quality_variant = select_image_quality(user_tier)
+            
+            # VIDEO RESTRICTION: Free users cannot generate videos
+            if mode == "video" and user_tier in FREE_TIERS:
+                logger.warning(f"[MEDIA_BILLING] Video generation blocked for free user {account_id}")
+                return ToolResult(success=True, output="Video generation requires a paid subscription. Please upgrade your plan to access video generation features.")
             
             if account_id and not use_mock:
                 has_credits, credit_msg, balance = await media_billing.check_credits(account_id)
@@ -205,9 +281,9 @@ class SandboxImageEditTool(SandboxToolsBase):
                     if mode == "edit":
                         # Use corresponding image or fall back to first one
                         img_path = image_paths[i] if i < len(image_paths) else image_paths[0]
-                        tasks.append(self._execute_single_image_operation(mode, p, img_path, use_mock))
+                        tasks.append(self._execute_single_image_operation(mode, p, img_path, use_mock, quality_variant))
                     else:
-                        tasks.append(self._execute_single_image_operation(mode, p, None, use_mock))
+                        tasks.append(self._execute_single_image_operation(mode, p, None, use_mock, quality_variant))
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 elapsed_time = time.time() - start_time
                 logger.info(f"Batch image operation completed in {elapsed_time:.2f}s (concurrent execution)")
@@ -236,8 +312,9 @@ class SandboxImageEditTool(SandboxToolsBase):
                         account_id=account_id,
                         model="openai/gpt-image-1.5",
                         count=len(image_files),
-                        description=f"Batch image {mode} ({len(image_files)} images)",
+                        description=f"Batch image {mode} ({len(image_files)} images, quality={quality_variant})",
                         thread_id=thread_id,
+                        variant=quality_variant,
                     )
                 
                 # If canvas_path provided, add all successful images to canvas
@@ -261,7 +338,69 @@ class SandboxImageEditTool(SandboxToolsBase):
                 
                 return ToolResult(success=True, output="\n".join(lines))
             else:
-                # Single prompt mode
+                # Single operation mode
+                
+                # Handle upscale mode (no prompt needed)
+                if mode == "upscale":
+                    logger.info(f"Executing upscale for image: '{image_path}'")
+                    result = await self._execute_upscale_operation(image_path, use_mock)
+                    
+                    if isinstance(result, ToolResult):
+                        return ToolResult(success=True, output=f"Failed: {result.output}")
+                    
+                    # BILLING: Deduct credits for successful upscale
+                    if account_id and not use_mock:
+                        await media_billing.deduct_replicate_image(
+                            account_id=account_id,
+                            model=UPSCALE_MODEL,
+                            count=1,
+                            description="Image upscale",
+                            thread_id=thread_id,
+                        )
+                    
+                    output_lines = [f"Upscaled image saved as: /workspace/{result}"]
+                    
+                    # If canvas_path provided, add to canvas
+                    if canvas_path:
+                        canvas_info = await self._add_images_to_canvas(
+                            [result], canvas_path, canvas_x, canvas_y
+                        )
+                        if canvas_info:
+                            output_lines.append(f"Added to canvas: {canvas_path} ({canvas_info['total_elements']} total elements)")
+                    
+                    return ToolResult(success=True, output="\n".join(output_lines))
+                
+                # Handle remove_bg mode (no prompt needed)
+                if mode == "remove_bg":
+                    logger.info(f"Executing remove_bg for image: '{image_path}'")
+                    result = await self._execute_remove_bg_operation(image_path, use_mock)
+                    
+                    if isinstance(result, ToolResult):
+                        return ToolResult(success=True, output=f"Failed: {result.output}")
+                    
+                    # BILLING: Deduct credits for successful remove_bg
+                    if account_id and not use_mock:
+                        await media_billing.deduct_replicate_image(
+                            account_id=account_id,
+                            model=REMOVE_BG_MODEL,
+                            count=1,
+                            description="Background removal",
+                            thread_id=thread_id,
+                        )
+                    
+                    output_lines = [f"Background removed, saved as: /workspace/{result}"]
+                    
+                    # If canvas_path provided, add to canvas
+                    if canvas_path:
+                        canvas_info = await self._add_images_to_canvas(
+                            [result], canvas_path, canvas_x, canvas_y
+                        )
+                        if canvas_info:
+                            output_lines.append(f"Added to canvas: {canvas_path} ({canvas_info['total_elements']} total elements)")
+                    
+                    return ToolResult(success=True, output="\n".join(output_lines))
+                
+                # For generate/edit/video modes, prompt is required
                 if not prompt or not isinstance(prompt, str):
                     return ToolResult(success=True, output="Error: A valid prompt is required.")
                 
@@ -293,9 +432,9 @@ class SandboxImageEditTool(SandboxToolsBase):
                     return ToolResult(success=True, output=f"Video saved as: /workspace/{result}")
                 
                 # Image mode (generate/edit)
-                logger.info(f"Executing single image operation with mode '{mode}' for prompt: '{prompt[:50]}...'")
+                logger.info(f"Executing single image operation with mode '{mode}' for prompt: '{prompt[:50]}...' (quality={quality_variant})")
                 
-                result = await self._execute_single_image_operation(mode, prompt, image_path, use_mock)
+                result = await self._execute_single_image_operation(mode, prompt, image_path, use_mock, quality_variant)
                 
                 if isinstance(result, ToolResult):
                     # Error - return gracefully with friendly message
@@ -307,8 +446,9 @@ class SandboxImageEditTool(SandboxToolsBase):
                         account_id=account_id,
                         model="openai/gpt-image-1.5",
                         count=1,
-                        description=f"Image {mode}",
+                        description=f"Image {mode} (quality={quality_variant})",
                         thread_id=thread_id,
+                        variant=quality_variant,
                     )
                 
                 # Success - result is filename (include full path so AI knows exact location)
@@ -343,7 +483,8 @@ class SandboxImageEditTool(SandboxToolsBase):
         mode: str,
         prompt: str,
         image_path: Optional[str],
-        use_mock: bool
+        use_mock: bool,
+        quality: str = "medium"
     ) -> str | ToolResult:
         """
         Helper function to execute a single image generation or edit operation.
@@ -354,6 +495,7 @@ class SandboxImageEditTool(SandboxToolsBase):
         - prompt: The text prompt for generation/editing
         - image_path: Path to image (required for edit mode)
         - use_mock: Whether to use mock mode
+        - quality: Quality variant ('low', 'medium', 'high') - affects output quality and cost
         
         Returns:
         - str: Filename of the generated/edited image on success
@@ -372,14 +514,14 @@ class SandboxImageEditTool(SandboxToolsBase):
             self._get_replicate_token()
 
             if mode == "generate":
-                logger.info(f"Calling Replicate openai/gpt-image-1.5 for generation")
+                logger.info(f"Calling Replicate openai/gpt-image-1.5 for generation (quality={quality})")
                 output = replicate.run(
                     "openai/gpt-image-1.5",
                     input={
                         "prompt": prompt,
                         "aspect_ratio": "1:1",
                         "number_of_images": 1,
-                        "quality": "high",
+                        "quality": quality,
                     }
                 )
             elif mode == "edit":
@@ -394,7 +536,7 @@ class SandboxImageEditTool(SandboxToolsBase):
                 image_b64 = base64.b64encode(image_bytes).decode('utf-8')
                 image_data_url = f"data:image/png;base64,{image_b64}"
 
-                logger.info(f"Calling Replicate openai/gpt-image-1.5 for editing with image_path='{image_path}' (image size: {len(image_bytes)} bytes, base64 length: {len(image_b64)} chars)")
+                logger.info(f"Calling Replicate openai/gpt-image-1.5 for editing (quality={quality}) with image_path='{image_path}' (image size: {len(image_bytes)} bytes)")
                 output = replicate.run(
                     "openai/gpt-image-1.5",
                     input={
@@ -402,7 +544,7 @@ class SandboxImageEditTool(SandboxToolsBase):
                         "input_images": [image_data_url],  # Note: input_images is an ARRAY
                         "aspect_ratio": "1:1",
                         "number_of_images": 1,
-                        "quality": "high",
+                        "quality": quality,
                     }
                 )
             else:
@@ -564,6 +706,123 @@ class SandboxImageEditTool(SandboxToolsBase):
             error_message = str(e)
             logger.error(f"Error generating video for prompt '{prompt[:50]}...': {error_message}")
             
+            friendly_message = self._extract_friendly_error(e)
+            return self.fail_response(friendly_message)
+    
+    async def _execute_upscale_operation(
+        self,
+        image_path: str,
+        use_mock: bool
+    ) -> str | ToolResult:
+        """
+        Upscale image using recraft-ai/recraft-crisp-upscale via Replicate.
+        
+        Parameters:
+        - image_path: Path to the image to upscale
+        - use_mock: Whether to use mock mode
+        
+        Returns:
+        - str: Filename of the upscaled image on success
+        - ToolResult: Error result on failure
+        """
+        try:
+            if use_mock:
+                logger.warning(f"🔍 Upscale running in MOCK mode for: '{image_path}'")
+                return f"upscaled_image_{uuid.uuid4().hex[:8]}.webp"
+            
+            # Get image bytes
+            if isinstance(image_path, list):
+                image_path = image_path[0] if image_path else None
+            if not image_path:
+                return self.fail_response("No image path provided for upscale.")
+            
+            image_bytes = await self._get_image_bytes(image_path)
+            if isinstance(image_bytes, ToolResult):
+                return image_bytes
+            
+            # Determine mime type
+            mime_type = "image/png"
+            if image_path.lower().endswith(".jpg") or image_path.lower().endswith(".jpeg"):
+                mime_type = "image/jpeg"
+            elif image_path.lower().endswith(".webp"):
+                mime_type = "image/webp"
+            
+            # Call the shared upscale function (runs in thread to not block)
+            loop = asyncio.get_event_loop()
+            result_bytes, result_mime = await loop.run_in_executor(
+                None, upscale_image_sync, image_bytes, mime_type
+            )
+            
+            # Save to sandbox with random filename
+            ext = "webp"  # Upscale outputs webp
+            random_filename = f"upscaled_{uuid.uuid4().hex[:8]}.{ext}"
+            sandbox_path = f"{self.workspace_path}/{random_filename}"
+            await self.sandbox.fs.upload_file(result_bytes, sandbox_path)
+            
+            logger.info(f"Upscaled image saved: {random_filename}")
+            return random_filename
+            
+        except Exception as e:
+            error_message = str(e)
+            logger.error(f"Error upscaling image '{image_path}': {error_message}")
+            friendly_message = self._extract_friendly_error(e)
+            return self.fail_response(friendly_message)
+    
+    async def _execute_remove_bg_operation(
+        self,
+        image_path: str,
+        use_mock: bool
+    ) -> str | ToolResult:
+        """
+        Remove background from image using 851-labs/background-remover via Replicate.
+        
+        Parameters:
+        - image_path: Path to the image
+        - use_mock: Whether to use mock mode
+        
+        Returns:
+        - str: Filename of the result image (PNG with transparency) on success
+        - ToolResult: Error result on failure
+        """
+        try:
+            if use_mock:
+                logger.warning(f"✂️ Remove BG running in MOCK mode for: '{image_path}'")
+                return f"nobg_image_{uuid.uuid4().hex[:8]}.png"
+            
+            # Get image bytes
+            if isinstance(image_path, list):
+                image_path = image_path[0] if image_path else None
+            if not image_path:
+                return self.fail_response("No image path provided for background removal.")
+            
+            image_bytes = await self._get_image_bytes(image_path)
+            if isinstance(image_bytes, ToolResult):
+                return image_bytes
+            
+            # Determine mime type
+            mime_type = "image/png"
+            if image_path.lower().endswith(".jpg") or image_path.lower().endswith(".jpeg"):
+                mime_type = "image/jpeg"
+            elif image_path.lower().endswith(".webp"):
+                mime_type = "image/webp"
+            
+            # Call the shared remove_bg function (runs in thread to not block)
+            loop = asyncio.get_event_loop()
+            result_bytes, result_mime = await loop.run_in_executor(
+                None, remove_background_sync, image_bytes, mime_type
+            )
+            
+            # Save to sandbox with random filename (PNG for transparency)
+            random_filename = f"nobg_{uuid.uuid4().hex[:8]}.png"
+            sandbox_path = f"{self.workspace_path}/{random_filename}"
+            await self.sandbox.fs.upload_file(result_bytes, sandbox_path)
+            
+            logger.info(f"Background removed, saved: {random_filename}")
+            return random_filename
+            
+        except Exception as e:
+            error_message = str(e)
+            logger.error(f"Error removing background from '{image_path}': {error_message}")
             friendly_message = self._extract_friendly_error(e)
             return self.fail_response(friendly_message)
     
@@ -773,18 +1032,12 @@ class SandboxImageEditTool(SandboxToolsBase):
                         elem_width = actual_width
                         elem_height = actual_height
                     
-                    # Convert to base64 for embedding
-                    ext = image_file.lower().split('.')[-1] if '.' in image_file else 'png'
-                    mime_map = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'gif': 'image/gif', 'webp': 'image/webp'}
-                    mime_type = mime_map.get(ext, 'image/png')
-                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-                    image_data_url = f"data:{mime_type};base64,{image_base64}"
-                    
-                    # Create element
+                    # Create element with PATH reference (NOT base64 - avoids LLM context bloat)
+                    # Frontend canvas-renderer.tsx fetches images via sandbox API
                     element = {
                         "id": str(uuid.uuid4()),
                         "type": "image",
-                        "src": image_data_url,
+                        "src": image_file,  # Store path, not base64
                         "x": current_x,
                         "y": current_y,
                         "width": elem_width,

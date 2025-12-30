@@ -1,6 +1,5 @@
 import os
 from enum import Enum
-from re import S
 from typing import Dict, Any, Optional, get_type_hints, Union
 from dotenv import load_dotenv
 import logging
@@ -301,7 +300,7 @@ class Configuration:
     OPENAI_COMPATIBLE_API_KEY: Optional[str] = None
     OPENAI_COMPATIBLE_API_BASE: Optional[str] = None
     OR_SITE_URL: Optional[str] = "https://www.kortix.com"
-    OR_APP_NAME: Optional[str] = "Kortix AI"
+    OR_APP_NAME: Optional[str] = "Kortix.com"
     
     # Frontend URL configuration
     FRONTEND_URL_ENV: Optional[str] = None
@@ -377,7 +376,7 @@ class Configuration:
     # Debug configuration
     # Set to True to save LLM API call inputs and stream outputs to debug_streams/ directory
     # Always False in production, regardless of environment variable
-    _DEBUG_SAVE_LLM_IO: Optional[bool] = True
+    _DEBUG_SAVE_LLM_IO: Optional[bool] = False
     
     @property
     def DEBUG_SAVE_LLM_IO(self) -> bool:

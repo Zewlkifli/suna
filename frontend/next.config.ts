@@ -46,6 +46,17 @@ const nextConfig = (): NextConfig => ({
     return config;
   },
   
+  // Turbopack configuration
+  turbopack: {
+    // Handle Node.js modules that shouldn't be bundled for browser builds
+    // Canvas is a Node.js native module that needs to be externalized (required for Konva & react-konva)
+    resolveAlias: {
+      canvas: {
+        browser: './src/lib/empty-module.ts', // Exclude canvas from browser builds
+      },
+    },
+  },
+  
   // Performance optimizations
   experimental: {
     // Optimize package imports for faster builds and smaller bundles

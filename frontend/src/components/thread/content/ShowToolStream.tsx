@@ -47,6 +47,19 @@ const STREAMABLE_TOOLS = {
         'Scraping Website',
     ]),
 
+    SPREADSHEET_TOOLS: new Set([
+        'Spreadsheet Create',
+        'Spreadsheet Add Rows',
+        'Spreadsheet Update Cell',
+        'Spreadsheet Format Cells',
+        'Spreadsheet Read',
+        'Creating Spreadsheet',
+        'Adding Rows',
+        'Updating Cell',
+        'Formatting Cells',
+        'Reading Spreadsheet',
+    ]),
+
     // Other tools that benefit from content streaming
     OTHER_STREAMABLE: new Set([
         'Calling data provider',
@@ -130,6 +143,13 @@ export const ShowToolStream: React.FC<ShowToolStreamProps> = ({
     const isFullFileRewrite = toolName === 'Rewriting File';
     
     const effectiveToolCall = toolCall || parsedToolCall;
+    
+    // Check if tool is completed (has tool_result or completed flag)
+    // tool_result can be an object with success/output/error, or just a truthy value
+    const isCompleted = effectiveToolCall?.completed === true || 
+                       (effectiveToolCall?.tool_result !== undefined && 
+                        effectiveToolCall?.tool_result !== null &&
+                        (typeof effectiveToolCall.tool_result === 'object' || Boolean(effectiveToolCall.tool_result)));
 
     // Extract content from JSON or plain text
     const extractContent = (rawContent: string): { html: string; plainText: string } => {
@@ -298,7 +318,7 @@ export const ShowToolStream: React.FC<ShowToolStreamProps> = ({
             (typeof effectiveToolCall?.arguments === 'string' && effectiveToolCall.arguments.includes('video_options'));
 
         return (
-            <div className="my-1.5 space-y-2">
+            <div className="space-y-2">
                 {/* Tool button - exactly like regular tools */}
                 <button
                     onClick={() => onToolClick?.(messageId ?? null, toolName, effectiveToolCall?.tool_call_id)}
@@ -306,7 +326,9 @@ export const ShowToolStream: React.FC<ShowToolStreamProps> = ({
                 >
                     <AppIcon toolCall={effectiveToolCall} size={14} className="h-3.5 w-3.5 text-muted-foreground shrink-0" fallbackIcon={IconComponent} />
                     <span className="font-mono text-xs text-foreground">Generate Media</span>
-                    <CircleDashed className="h-3.5 w-3.5 text-muted-foreground shrink-0 animate-spin ml-1" />
+                    {!isCompleted && (
+                        <CircleDashed className="h-3.5 w-3.5 text-muted-foreground shrink-0 animate-spin ml-1" />
+                    )}
                 </button>
 
                 {/* Shimmer below - aspect-video for video, aspect-square for image */}
@@ -347,7 +369,7 @@ export const ShowToolStream: React.FC<ShowToolStreamProps> = ({
     // Always show tool button, conditionally show content below for streamable tools
     if (showExpanded && isToolStreamable) {
         return (
-            <div className="my-1.5">
+            <div>
                 {/* Always render the container for smooth transitions */}
                 <div className={`border border-neutral-200 dark:border-neutral-700/50 rounded-2xl overflow-hidden transition-all duration-500 ease-in-out transform-gpu ${shouldShowContent ? 'bg-zinc-100 dark:bg-neutral-900' : 'bg-muted scale-95 opacity-80'
                     }`}>
@@ -362,7 +384,9 @@ export const ShowToolStream: React.FC<ShowToolStreamProps> = ({
                         </div>
                         <span className="font-mono text-xs text-foreground flex-1">{displayName}</span>
                         {paramDisplay && <span className="ml-1 text-xs text-muted-foreground truncate max-w-[200px]" title={paramDisplay}>{paramDisplay}</span>}
-                        <CircleDashed className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0 animate-spin animation-duration-2000 ml-auto" />
+                        {!isCompleted && (
+                            <CircleDashed className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0 animate-spin animation-duration-2000 ml-auto" />
+                        )}
                     </button>
 
                     {/* Streaming content below - smooth height transition */}
@@ -417,6 +441,13 @@ export const ShowToolStream: React.FC<ShowToolStreamProps> = ({
                                         }
                                         return prefix + contentToDisplay;
                                     }
+                                    if (STREAMABLE_TOOLS.SPREADSHEET_TOOLS.has(toolName || '')) {
+                                        // For spreadsheet tools, show with table emoji prefix
+                                        if (htmlContent !== contentToDisplay) {
+                                            return <span dangerouslySetInnerHTML={{ __html: htmlContent }} />;
+                                        }
+                                        return contentToDisplay;
+                                    }
                                     if (STREAMABLE_TOOLS.OTHER_STREAMABLE.has(toolName || '')) {
                                         // For other tools, render HTML if available
                                         if (htmlContent !== contentToDisplay) {
@@ -446,7 +477,7 @@ export const ShowToolStream: React.FC<ShowToolStreamProps> = ({
     }
 
     return (
-        <div className="my-1.5">
+        <div>
             <button
                 onClick={() => onToolClick?.(messageId ?? null, toolName, effectiveToolCall?.tool_call_id)}
                 className="inline-flex items-center gap-1.5 h-8 px-2 py-1.5 text-xs text-muted-foreground bg-card hover:bg-card/80 rounded-lg transition-colors cursor-pointer border border-neutral-200 dark:border-neutral-700/50 whitespace-nowrap"
@@ -456,7 +487,9 @@ export const ShowToolStream: React.FC<ShowToolStreamProps> = ({
                 </div>
                 <span className="font-mono text-xs text-foreground">{displayName}</span>
                 {paramDisplay && <span className="ml-1 text-xs text-muted-foreground truncate max-w-[200px]" title={paramDisplay}>{paramDisplay}</span>}
-                <CircleDashed className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0 animate-spin animation-duration-2000 ml-1" />
+                {!isCompleted && (
+                    <CircleDashed className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0 animate-spin animation-duration-2000 ml-1" />
+                )}
             </button>
         </div>
     );

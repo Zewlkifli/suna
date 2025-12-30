@@ -1,13 +1,15 @@
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from core.agentpress.tool import ToolResult, openapi_schema, tool_metadata
 from core.sandbox.tool_base import SandboxToolsBase
 from core.agentpress.thread_manager import ThreadManager
 from core.utils.logger import logger
+from core.utils.image_processing import upscale_image_sync, remove_background_sync, UPSCALE_MODEL, REMOVE_BG_MODEL
+from core.billing.credits.media_integration import media_billing
 import json
 import uuid
-import base64
 import asyncio
 import io
+import os
 from datetime import datetime
 from PIL import Image
 
@@ -17,7 +19,7 @@ _canvas_locks: Dict[str, asyncio.Lock] = {}
 
 @tool_metadata(
     display_name="Canvas Editor",
-    description="Create and manage interactive canvases for image composition and design",
+    description="Create and manage interactive canvases for image composition and design. Includes AI processing (upscale, remove background) for canvas elements.",
     icon="Layout",
     color="bg-blue-100 dark:bg-blue-800/50",
     weight=215,
@@ -29,28 +31,34 @@ _canvas_locks: Dict[str, asyncio.Lock] = {}
 ```python
 # BEST: Single call generates AND adds to canvas (auto-creates canvas if needed)
 image_edit_or_generate(
-    mode="generate",
-    prompt=["logo design", "background pattern", "icon set"],
+    prompt=["logo design", "background pattern"],
     canvas_path="canvases/my-design.kanvax"
 )
-# This: generates 3 images, creates canvas if needed, adds all images automatically
 ```
 
-**📦 MANUAL WORKFLOW (backup/advanced control):**
-Use these tools when you need fine control over canvas or element positioning:
-
+**🎨 AI PROCESSING ON CANVAS ELEMENTS:**
 ```python
-# 1. Create canvas manually
-create_canvas(name="my-design", background="#1a1a1a")
+# List elements to get IDs
+list_canvas_elements(canvas_path="canvases/my-design.kanvax")
 
-# 2. Add images one at a time (NEVER parallel!)
-add_image_to_canvas(canvas_path="canvases/my-design.kanvax", image_path="image.png", x=100, y=100)
+# Upscale an image on the canvas
+ai_process_canvas_element(
+    canvas_path="canvases/my-design.kanvax",
+    element_id="abc-123",
+    action="upscale"
+)
+
+# Remove background from an image on the canvas
+ai_process_canvas_element(
+    canvas_path="canvases/my-design.kanvax",
+    element_id="abc-123",
+    action="remove_bg"
+)
 ```
 
-**⚠️ MANUAL WORKFLOW RULES:**
+**⚠️ RULES:**
 - NEVER call add_image_to_canvas in PARALLEL - causes race conditions!
-- Call ONE AT A TIME, wait for each to complete
-- Use EXACT filenames returned from image generation
+- Use list_canvas_elements to get element IDs before processing
 """
 )
 class SandboxCanvasTool(SandboxToolsBase):
@@ -158,25 +166,26 @@ class SandboxCanvasTool(SandboxToolsBase):
         "type": "function",
         "function": {
             "name": "create_canvas",
-            "description": "Create a new infinite canvas for image composition and design. Canvas is infinite - no fixed dimensions. Just add images at any position.",
+            "description": "Create a new infinite canvas for image composition and design. Canvas is infinite - no fixed dimensions. Just add images at any position. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `name` (REQUIRED), `description` (optional), `background` (optional).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Name for the canvas (will be sanitized for filename). Use descriptive names like 'product-mockup' or 'social-media-banner'."
+                        "description": "**REQUIRED** - Name for the canvas (will be sanitized for filename). Use descriptive names like 'product-mockup' or 'social-media-banner'."
                     },
                     "description": {
                         "type": "string",
-                        "description": "Optional description of the canvas purpose or content"
+                        "description": "**OPTIONAL** - Description of the canvas purpose or content."
                     },
                     "background": {
                         "type": "string",
-                        "description": "Background color in hex format (e.g., '#1a1a1a' for dark, '#ffffff' for white)",
+                        "description": "**OPTIONAL** - Background color in hex format. Example: '#1a1a1a' for dark, '#ffffff' for white. Default: '#1a1a1a'.",
                         "default": "#1a1a1a"
                     }
                 },
-                "required": ["name"]
+                "required": ["name"],
+                "additionalProperties": False
             }
         }
     })
@@ -228,17 +237,17 @@ class SandboxCanvasTool(SandboxToolsBase):
         "type": "function",
         "function": {
             "name": "save_canvas",
-            "description": "Save canvas data with all elements. Used to persist user changes from the canvas editor.",
+            "description": "Save canvas data with all elements. Used to persist user changes from the canvas editor. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `canvas_path` (REQUIRED), `elements` (REQUIRED).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "canvas_path": {
                         "type": "string",
-                        "description": "Path to the canvas file (e.g., 'canvases/project-mockup.kanvax')"
+                        "description": "**REQUIRED** - Path to the canvas file. Example: 'canvases/project-mockup.kanvax'"
                     },
                     "elements": {
                         "type": "array",
-                        "description": "Array of canvas elements with their properties",
+                        "description": "**REQUIRED** - Array of canvas elements with their properties (id, type, src, x, y, width, height, rotation, scaleX, scaleY, opacity, locked, name).",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -259,7 +268,8 @@ class SandboxCanvasTool(SandboxToolsBase):
                         }
                     }
                 },
-                "required": ["canvas_path", "elements"]
+                "required": ["canvas_path", "elements"],
+                "additionalProperties": False
             }
         }
     })
@@ -303,44 +313,45 @@ class SandboxCanvasTool(SandboxToolsBase):
         "type": "function",
         "function": {
             "name": "add_image_to_canvas",
-            "description": "Add an image element to an existing canvas. Image can be from designs folder or any workspace path.",
+            "description": "Add an image element to an existing canvas. Image can be from designs folder or any workspace path. **⚠️ IMPORTANT**: NEVER call this function in parallel - causes race conditions! Call ONE AT A TIME. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `canvas_path` (REQUIRED), `image_path` (REQUIRED), `x` (optional), `y` (optional), `width` (optional), `height` (optional), `name` (optional).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "canvas_path": {
                         "type": "string",
-                        "description": "Path to the canvas file (e.g., 'canvases/project-mockup.kanvax')"
+                        "description": "**REQUIRED** - Path to the canvas file. Example: 'canvases/project-mockup.kanvax'"
                     },
                     "image_path": {
                         "type": "string",
-                        "description": "Path to the image file relative to workspace (e.g., 'designs/logo.png')"
+                        "description": "**REQUIRED** - Path to the image file relative to workspace. Example: 'designs/logo.png'"
                     },
                     "x": {
                         "type": "number",
-                        "description": "X position on canvas in pixels",
+                        "description": "**OPTIONAL** - X position on canvas in pixels. Default: 100.",
                         "default": 100
                     },
                     "y": {
                         "type": "number",
-                        "description": "Y position on canvas in pixels",
+                        "description": "**OPTIONAL** - Y position on canvas in pixels. Default: 100.",
                         "default": 100
                     },
                     "width": {
                         "type": "number",
-                        "description": "Width of the image in pixels (optional, uses original size if not specified)",
+                        "description": "**OPTIONAL** - Width of the image in pixels. Uses original size if not specified. Minimum: 1.",
                         "minimum": 1
                     },
                     "height": {
                         "type": "number",
-                        "description": "Height of the image in pixels (optional, uses original size if not specified)",
+                        "description": "**OPTIONAL** - Height of the image in pixels. Uses original size if not specified. Minimum: 1.",
                         "minimum": 1
                     },
                     "name": {
                         "type": "string",
-                        "description": "Optional name for the element (defaults to image filename)"
+                        "description": "**OPTIONAL** - Name for the element. Defaults to image filename if not provided."
                     }
                 },
-                "required": ["canvas_path", "image_path"]
+                "required": ["canvas_path", "image_path"],
+                "additionalProperties": False
             }
         }
     })
@@ -384,8 +395,7 @@ class SandboxCanvasTool(SandboxToolsBase):
                 except:
                     return self.fail_response(f"Image not found at {image_path}")
                 
-                # Convert image to base64 data URL for embedding in canvas
-                # This makes the canvas self-contained
+                # Get image bytes to read dimensions (not for embedding)
                 if isinstance(image_data, bytes):
                     image_bytes = image_data
                 else:
@@ -400,15 +410,8 @@ class SandboxCanvasTool(SandboxToolsBase):
                     logger.warning(f"Could not read image dimensions: {e}")
                     actual_img_width, actual_img_height = 400, 400
                 
-                # Determine MIME type from extension
-                ext = image_path.lower().split('.')[-1] if '.' in image_path else 'png'
-                mime_map = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'gif': 'image/gif', 'webp': 'image/webp'}
-                mime_type = mime_map.get(ext, 'image/png')
-                
-                image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-                image_data_url = f"data:{mime_type};base64,{image_base64}"
-
-                # Create element
+                # Create element - store PATH reference, NOT base64 (avoids LLM context bloat)
+                # Frontend canvas-renderer.tsx handles path-based src via getSandboxFileUrl()
                 element_id = str(uuid.uuid4())
                 element_name = name or image_path.split('/')[-1]
                 
@@ -472,7 +475,7 @@ class SandboxCanvasTool(SandboxToolsBase):
                 element = {
                     "id": element_id,
                     "type": "image",
-                    "src": image_data_url,  # Embedded base64 data URL - canvas is self-contained
+                    "src": image_path,  # Store path reference - frontend fetches via sandbox API
                     "x": actual_x,
                     "y": actual_y,
                     "width": elem_width,
@@ -512,16 +515,17 @@ class SandboxCanvasTool(SandboxToolsBase):
         "type": "function",
         "function": {
             "name": "list_canvas_elements",
-            "description": "List all elements in a canvas with their properties",
+            "description": "List all elements in a canvas with their properties. **🚨 PARAMETER NAMES**: Use EXACTLY this parameter name: `canvas_path` (REQUIRED).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "canvas_path": {
                         "type": "string",
-                        "description": "Path to the canvas file (e.g., 'canvases/project-mockup.kanvax')"
+                        "description": "**REQUIRED** - Path to the canvas file. Example: 'canvases/project-mockup.kanvax'"
                     }
                 },
-                "required": ["canvas_path"]
+                "required": ["canvas_path"],
+                "additionalProperties": False
             }
         }
     })
@@ -536,16 +540,25 @@ class SandboxCanvasTool(SandboxToolsBase):
 
             elements_info = []
             for element in canvas_data.get("elements", []):
+                # Get src info but NEVER include base64 data in tool results (LLM context bloat)
+                src = element.get("src", "")
+                if src.startswith("data:"):
+                    # Base64 embedded - just indicate it exists
+                    src_info = "(embedded image)"
+                else:
+                    # File path reference - safe to include
+                    src_info = src
+                
                 elements_info.append({
                     "id": element["id"],
                     "name": element["name"],
                     "type": element["type"],
-                    "src": element["src"],
+                    "src": src_info,  # Path or indicator, NEVER base64 data
                     "position": {"x": element["x"], "y": element["y"]},
                     "size": {"width": element["width"], "height": element["height"]},
-                    "rotation": element["rotation"],
-                    "opacity": element["opacity"],
-                    "locked": element["locked"]
+                    "rotation": element.get("rotation", 0),
+                    "opacity": element.get("opacity", 1),
+                    "locked": element.get("locked", False)
                 })
 
             result = {
@@ -566,28 +579,29 @@ class SandboxCanvasTool(SandboxToolsBase):
         "type": "function",
         "function": {
             "name": "update_canvas_element",
-            "description": "Update properties of a canvas element (position, size, rotation, etc.)",
+            "description": "Update properties of a canvas element (position, size, rotation, etc.). **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `canvas_path` (REQUIRED), `element_id` (REQUIRED), `x` (optional), `y` (optional), `width` (optional), `height` (optional), `rotation` (optional), `opacity` (optional), `locked` (optional), `name` (optional).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "canvas_path": {
                         "type": "string",
-                        "description": "Path to the canvas file"
+                        "description": "**REQUIRED** - Path to the canvas file. Example: 'canvases/project-mockup.kanvax'"
                     },
                     "element_id": {
                         "type": "string",
-                        "description": "ID of the element to update"
+                        "description": "**REQUIRED** - ID of the element to update."
                     },
-                    "x": {"type": "number", "description": "New X position"},
-                    "y": {"type": "number", "description": "New Y position"},
-                    "width": {"type": "number", "description": "New width"},
-                    "height": {"type": "number", "description": "New height"},
-                    "rotation": {"type": "number", "description": "Rotation in degrees"},
-                    "opacity": {"type": "number", "description": "Opacity (0-1)", "minimum": 0, "maximum": 1},
-                    "locked": {"type": "boolean", "description": "Lock element to prevent changes"},
-                    "name": {"type": "string", "description": "Element name"}
+                    "x": {"type": "number", "description": "**OPTIONAL** - New X position in pixels."},
+                    "y": {"type": "number", "description": "**OPTIONAL** - New Y position in pixels."},
+                    "width": {"type": "number", "description": "**OPTIONAL** - New width in pixels."},
+                    "height": {"type": "number", "description": "**OPTIONAL** - New height in pixels."},
+                    "rotation": {"type": "number", "description": "**OPTIONAL** - Rotation in degrees."},
+                    "opacity": {"type": "number", "description": "**OPTIONAL** - Opacity value between 0 and 1. Minimum: 0, Maximum: 1.", "minimum": 0, "maximum": 1},
+                    "locked": {"type": "boolean", "description": "**OPTIONAL** - Lock element to prevent changes."},
+                    "name": {"type": "string", "description": "**OPTIONAL** - Element name."}
                 },
-                "required": ["canvas_path", "element_id"]
+                "required": ["canvas_path", "element_id"],
+                "additionalProperties": False
             }
         }
     })
@@ -644,20 +658,21 @@ class SandboxCanvasTool(SandboxToolsBase):
         "type": "function",
         "function": {
             "name": "remove_canvas_element",
-            "description": "Remove an element from the canvas",
+            "description": "Remove an element from the canvas. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `canvas_path` (REQUIRED), `element_id` (REQUIRED).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "canvas_path": {
                         "type": "string",
-                        "description": "Path to the canvas file"
+                        "description": "**REQUIRED** - Path to the canvas file. Example: 'canvases/project-mockup.kanvax'"
                     },
                     "element_id": {
                         "type": "string",
-                        "description": "ID of the element to remove"
+                        "description": "**REQUIRED** - ID of the element to remove."
                     }
                 },
-                "required": ["canvas_path", "element_id"]
+                "required": ["canvas_path", "element_id"],
+                "additionalProperties": False
             }
         }
     })
@@ -700,4 +715,222 @@ class SandboxCanvasTool(SandboxToolsBase):
 
         except Exception as e:
             return self.fail_response(f"Failed to remove element: {str(e)}")
+
+    @openapi_schema({
+        "type": "function",
+        "function": {
+            "name": "ai_process_canvas_element",
+            "description": "Apply AI processing (upscale or remove background) to an image element on the canvas. The processed result is added as a NEW element next to the original. **🚨 PARAMETER NAMES**: Use EXACTLY these parameter names: `canvas_path` (REQUIRED), `element_id` (REQUIRED), `action` (REQUIRED: 'upscale' or 'remove_bg').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "canvas_path": {
+                        "type": "string",
+                        "description": "**REQUIRED** - Path to the canvas file. Example: 'canvases/project-mockup.kanvax'"
+                    },
+                    "element_id": {
+                        "type": "string",
+                        "description": "**REQUIRED** - ID of the image element to process. Get this from list_canvas_elements."
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["upscale", "remove_bg"],
+                        "description": "**REQUIRED** - Action to perform: 'upscale' (enhance resolution) or 'remove_bg' (remove background)."
+                    }
+                },
+                "required": ["canvas_path", "element_id", "action"],
+                "additionalProperties": False
+            }
+        }
+    })
+    async def ai_process_canvas_element(
+        self,
+        canvas_path: str,
+        element_id: str,
+        action: Literal["upscale", "remove_bg"]
+    ) -> ToolResult:
+        """
+        Apply AI processing to a canvas element.
+        
+        1. Finds the element in the canvas
+        2. Gets its image data
+        3. Processes with AI (upscale or remove_bg)
+        4. Saves result as new file
+        5. Adds new element to canvas next to original
+        """
+        try:
+            await self._ensure_sandbox()
+            
+            # Validate action
+            if action not in ("upscale", "remove_bg"):
+                return self.fail_response(f"Invalid action '{action}'. Use 'upscale' or 'remove_bg'.")
+            
+            # Load canvas
+            canvas_data = await self._load_canvas_data(canvas_path)
+            if not canvas_data:
+                return self.fail_response(f"Canvas not found: {canvas_path}")
+            
+            # Find the element
+            source_element = None
+            for el in canvas_data.get("elements", []):
+                if el["id"] == element_id:
+                    source_element = el
+                    break
+            
+            if not source_element:
+                return self.fail_response(f"Element '{element_id}' not found in canvas")
+            
+            if source_element.get("type") != "image":
+                return self.fail_response(f"Element '{element_id}' is not an image (type: {source_element.get('type')})")
+            
+            # Get the image source
+            src = source_element.get("src", "")
+            if not src:
+                return self.fail_response(f"Element '{element_id}' has no image source")
+            
+            # Get image bytes
+            if src.startswith("data:"):
+                # Base64 embedded image
+                import base64
+                try:
+                    # Parse data URL: data:image/png;base64,xxxxx
+                    header, data = src.split(',', 1)
+                    mime_type = header.split(':')[1].split(';')[0]
+                    image_bytes = base64.b64decode(data)
+                except Exception as e:
+                    return self.fail_response(f"Failed to decode embedded image: {str(e)}")
+            else:
+                # File path reference
+                image_full_path = f"{self.workspace_path}/{src}"
+                try:
+                    image_bytes = await self.sandbox.fs.download_file(image_full_path)
+                    # Determine mime type from extension
+                    if src.lower().endswith(".jpg") or src.lower().endswith(".jpeg"):
+                        mime_type = "image/jpeg"
+                    elif src.lower().endswith(".webp"):
+                        mime_type = "image/webp"
+                    else:
+                        mime_type = "image/png"
+                except Exception as e:
+                    return self.fail_response(f"Failed to read image from '{src}': {str(e)}")
+            
+            # BILLING: Check credits before processing
+            account_id = getattr(self, '_account_id', None) or getattr(self, 'account_id', None)
+            if not account_id:
+                account_id = getattr(self.thread_manager, 'account_id', None)
+            
+            use_mock = os.getenv("MOCK_IMAGE_GENERATION", "false").lower() == "true"
+            
+            if account_id and not use_mock:
+                has_credits, credit_msg, balance = await media_billing.check_credits(account_id)
+                if not has_credits:
+                    return self.fail_response(f"Insufficient credits: {credit_msg}")
+            
+            # Process the image
+            logger.info(f"[Canvas AI] Processing element '{source_element.get('name', element_id)}' with action '{action}'")
+            
+            try:
+                loop = asyncio.get_event_loop()
+                if action == "upscale":
+                    result_bytes, result_mime = await loop.run_in_executor(
+                        None, upscale_image_sync, image_bytes, mime_type
+                    )
+                    output_ext = "webp"
+                    billing_model = UPSCALE_MODEL
+                else:  # remove_bg
+                    result_bytes, result_mime = await loop.run_in_executor(
+                        None, remove_background_sync, image_bytes, mime_type
+                    )
+                    output_ext = "png"
+                    billing_model = REMOVE_BG_MODEL
+            except Exception as e:
+                return self.fail_response(f"AI processing failed: {str(e)}")
+            
+            # BILLING: Deduct credits for successful processing
+            if account_id and not use_mock:
+                await media_billing.deduct_replicate_image(
+                    account_id=account_id,
+                    model=billing_model,
+                    count=1,
+                    description=f"Canvas {action}",
+                )
+            
+            # Save result to images directory
+            await self._ensure_images_dir()
+            action_prefix = "upscaled" if action == "upscale" else "nobg"
+            result_filename = f"{action_prefix}_{uuid.uuid4().hex[:8]}.{output_ext}"
+            result_path = f"{self.images_dir}/{result_filename}"
+            full_result_path = f"{self.workspace_path}/{result_path}"
+            await self.sandbox.fs.upload_file(result_bytes, full_result_path)
+            
+            # Get dimensions of result image
+            try:
+                img = Image.open(io.BytesIO(result_bytes))
+                result_width, result_height = img.size
+                img.close()
+            except:
+                result_width = source_element.get("width", 400)
+                result_height = source_element.get("height", 400)
+            
+            # Calculate position for new element (to the right of original)
+            new_x = source_element.get("x", 100) + source_element.get("width", 400) + 50
+            new_y = source_element.get("y", 100)
+            
+            # Scale down if needed (max 600px)
+            max_size = 600
+            aspect_ratio = result_width / result_height if result_height > 0 else 1
+            if result_width > max_size or result_height > max_size:
+                if result_width > result_height:
+                    elem_width = max_size
+                    elem_height = max_size / aspect_ratio
+                else:
+                    elem_height = max_size
+                    elem_width = max_size * aspect_ratio
+            else:
+                elem_width = result_width
+                elem_height = result_height
+            
+            # Create new element
+            new_element_id = str(uuid.uuid4())
+            action_label = "Upscaled" if action == "upscale" else "No BG"
+            original_name = source_element.get("name", "image")
+            new_element = {
+                "id": new_element_id,
+                "type": "image",
+                "src": result_path,
+                "x": new_x,
+                "y": new_y,
+                "width": elem_width,
+                "height": elem_height,
+                "rotation": 0,
+                "scaleX": 1,
+                "scaleY": 1,
+                "opacity": 1,
+                "locked": False,
+                "name": f"{action_label} - {original_name}"
+            }
+            
+            # Add to canvas
+            canvas_data["elements"].append(new_element)
+            await self._save_canvas_data(canvas_path, canvas_data)
+            
+            result = {
+                "canvas_path": canvas_path,
+                "source_element_id": element_id,
+                "source_element_name": source_element.get("name", element_id),
+                "new_element_id": new_element_id,
+                "new_element_name": new_element["name"],
+                "action": action,
+                "result_path": result_path,
+                "position": {"x": new_x, "y": new_y},
+                "size": {"width": elem_width, "height": elem_height},
+                "total_elements": len(canvas_data["elements"]),
+                "sandbox_id": self.sandbox_id,
+                "message": f"Applied '{action}' to '{original_name}' and added result to canvas"
+            }
+            
+            return self.success_response(result)
+            
+        except Exception as e:
+            return self.fail_response(f"Failed to process canvas element: {str(e)}")
 
