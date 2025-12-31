@@ -1,6 +1,6 @@
 'use client';
 import { siteConfig } from '@/lib/site-config';
-import { useIsMobile } from '@/hooks/utils';
+import { useIsMobile, useLeadingDebouncedCallback } from '@/hooks/utils';
 import dynamic from 'next/dynamic';
 import { useState, useEffect, useRef, lazy, Suspense } from 'react';
 import Link from 'next/link';
@@ -200,11 +200,15 @@ export function HeroSection() {
 
     const addOptimisticFiles = useOptimisticFilesStore((state) => state.addFiles);
 
-    const handleChatInputSubmit = async (
+    const handleChatInputSubmit = useLeadingDebouncedCallback(async (
         message: string,
         options?: { model_name?: string; enable_thinking?: boolean }
     ) => {
-        if ((!message.trim() && !chatInputRef.current?.getPendingFiles().length) || isSubmitting) return;
+        const pendingFiles = chatInputRef.current?.getPendingFiles() || [];
+
+        if ((!message.trim() && !pendingFiles.length) || isSubmitting) {
+            return;
+        }
         if (!user && !isLoading) {
             localStorage.setItem(PENDING_PROMPT_KEY, message.trim());
             setAuthDialogOpen(true);
@@ -212,37 +216,48 @@ export function HeroSection() {
         }
 
         setIsSubmitting(true);
+        let didNavigate = false;
         try {
-            const files = chatInputRef.current?.getPendingFiles() || [];
+            const files = pendingFiles;
             localStorage.removeItem(PENDING_PROMPT_KEY);
-            
+
             const normalizedFiles = files.map((file) => {
                 const normalizedName = normalizeFilenameToNFC(file.name);
                 return new File([file], normalizedName, { type: file.type });
             });
-            
+
             const threadId = crypto.randomUUID();
             const projectId = crypto.randomUUID();
             const trimmedMessage = message.trim();
-            
-            chatInputRef.current?.clearPendingFiles();
-            setInputValue('');
-            
+
             let promptWithFiles = trimmedMessage;
             if (normalizedFiles.length > 0) {
                 addOptimisticFiles(threadId, projectId, normalizedFiles);
                 sessionStorage.setItem('optimistic_files', 'true');
-                const fileRefs = normalizedFiles.map((f) => 
-                    `[Uploaded File: /workspace/uploads/${f.name}]`
+                const fileRefs = normalizedFiles.map((f) =>
+                    `[Uploaded File: uploads/${f.name}]`
                 ).join('\n');
                 promptWithFiles = `${trimmedMessage}\n\n${fileRefs}`;
             }
-            
+
             sessionStorage.setItem('optimistic_prompt', promptWithFiles);
             sessionStorage.setItem('optimistic_thread', threadId);
-            
+
+            if (process.env.NODE_ENV !== 'production') {
+                console.log('[HeroSection] Starting new thread:', {
+                    projectId,
+                    threadId,
+                    agent_id: selectedAgentId || undefined,
+                    model_name: options?.model_name,
+                    promptLength: promptWithFiles.length,
+                    promptPreview: promptWithFiles.slice(0, 140),
+                    files: normalizedFiles.map((f) => ({ name: f.name, size: f.size, type: f.type })),
+                });
+            }
+
             router.push(`/projects/${projectId}/thread/${threadId}?new=true`);
-            
+            didNavigate = true;
+
             optimisticAgentStart({
                 thread_id: threadId,
                 project_id: projectId,
@@ -350,10 +365,11 @@ export function HeroSection() {
                     error.message || 'Failed to create Worker. Please try again.',
                 );
             }
-        } finally {
-            setIsSubmitting(false);
+            if (!didNavigate) {
+                setIsSubmitting(false);
+            }
         }
-    };
+    }, 1200);
 
     return (
         <section id="hero" className="w-full relative overflow-hidden">
@@ -394,13 +410,12 @@ export function HeroSection() {
 
                 <div className="relative z-10 pt-20 sm:pt-24 md:pt-32 mx-auto h-full w-full max-w-6xl flex flex-col items-center justify-center min-h-[60vh] sm:min-h-0">
 
-                    <PromoBanner />
-
-                    <div className="flex flex-col items-center justify-center gap-3 sm:gap-4 pt-12 sm:pt-20 max-w-4xl mx-auto pb-6 sm:pb-7">
+                    <div className="flex flex-col items-center justify-center gap-4 sm:gap-5 pt-12 sm:pt-20 max-w-4xl mx-auto pb-4 sm:pb-5">
+                        <PromoBanner />
                         <DynamicGreeting className="text-2xl sm:text-3xl md:text-3xl lg:text-4xl font-medium text-balance text-center px-4 sm:px-2" />
                     </div>
 
-                    <div className="flex flex-col items-center w-full max-w-3xl mx-auto gap-2 flex-wrap justify-center px-4 sm:px-0 animate-in fade-in-0 slide-in-from-bottom-4 duration-500 delay-100 fill-mode-both">
+                    <div className="flex flex-col items-center w-full max-w-3xl mx-auto gap-2 flex-wrap justify-center px-4 sm:px-0 mt-1 animate-in fade-in-0 slide-in-from-bottom-4 duration-500 delay-100 fill-mode-both">
                         <div className="w-full relative">
                             <div className="relative z-10">
                                 <ChatInput

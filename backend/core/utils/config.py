@@ -369,14 +369,14 @@ class Configuration:
     STRIPE_PRODUCT_ID_STAGING: Optional[str] = 'prod_SCgIj3G7yPOAWY'
     
     # Sandbox configuration
-    SANDBOX_IMAGE_NAME = "kortix/suna:0.1.3.26"
-    SANDBOX_SNAPSHOT_NAME = "kortix/suna:0.1.3.26"
+    SANDBOX_IMAGE_NAME = "kortix/suna:0.1.3.28"
+    SANDBOX_SNAPSHOT_NAME = "kortix/suna:0.1.3.28"
     SANDBOX_ENTRYPOINT = "/usr/bin/supervisord -n -c /etc/supervisor/conf.d/supervisord.conf"
     
     # Debug configuration
     # Set to True to save LLM API call inputs and stream outputs to debug_streams/ directory
     # Always False in production, regardless of environment variable
-    _DEBUG_SAVE_LLM_IO: Optional[bool] = False
+    _DEBUG_SAVE_LLM_IO: Optional[bool] = True
     
     @property
     def DEBUG_SAVE_LLM_IO(self) -> bool:
