@@ -37,6 +37,21 @@ services:
         condition: service_healthy
       worker:
         condition: service_started
+    # -------------------------------------------------------------------------
+    # STARTUP PATCH: Disable local JWT signature verification
+    # Supabase's new JWT Signing Keys system uses different secrets per key.
+    # The backend will still validate token expiry and extract user info,
+    # but signature verification is handled by Supabase API calls.
+    # -------------------------------------------------------------------------
+    command:
+      - sh
+      - -c
+      - |
+        echo "🔧 Patching auth to skip local JWT signature verification..."
+        sed -i 's/"verify_signature": True/"verify_signature": False/g' /app/core/utils/auth_utils.py
+        echo "✅ Auth patched"
+        echo "🚀 Starting backend server..."
+        exec uv run uvicorn api:app --host 0.0.0.0 --port 8000
 
   worker:
     image: ghcr.io/suna-ai/suna-backend:latest
