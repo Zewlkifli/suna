@@ -62,12 +62,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # IMPORTANT: billing endpoints exist under /v1 on your production backend.
-        # Local dev default also corrected to localhost:8001 (matches ports mapping above).
         NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-https://api.kortix.darwisyah.com/v1}
-        # If you want local dev instead, use:
-        # NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://localhost:8001/v1}
-
         NEXT_PUBLIC_URL: ${NEXT_PUBLIC_URL:-https://kortix.darwisyah.com}
         NEXT_PUBLIC_ENV_MODE: ${NEXT_PUBLIC_ENV_MODE:-PRODUCTION}
 
@@ -76,22 +71,73 @@ services:
     depends_on:
       - backend
 
-    # ------------------------------------------------------------------------
-    # FIX: Prevent Next standalone server from using HOSTNAME=0.0.0.0 to build
-    # absolute redirects (e.g., https://0.0.0.0:3000/dashboard).
+    # -------------------------------------------------------------------------
+    # Environment variables for auth and URL handling
+    # -------------------------------------------------------------------------
+    environment:
+      - NEXTAUTH_URL=https://kortix.darwisyah.com
+      - NEXT_PUBLIC_APP_URL=https://kortix.darwisyah.com
+      - NEXT_PUBLIC_URL=https://kortix.darwisyah.com
+      - HOST=0.0.0.0
+      - PORT=3000
+
+    # -------------------------------------------------------------------------
+    # STARTUP PATCHES:
+    # 1. Fix server.js: Prevent Next.js from using HOSTNAME=0.0.0.0 for URLs
+    # 2. Fix auth callback: Force correct origin instead of nextUrl.origin
     #
-    # This patches /app/server.js at container startup, then runs the server.
-    # It survives redeploys because it's in docker-compose.
-    # ------------------------------------------------------------------------
+    # These patches run at container startup and survive redeploys.
+    # -------------------------------------------------------------------------
     command:
       - sh
       - -lc
-      - >
-        node -e "const fs=require('fs');const p='/app/server.js';let s=fs.readFileSync(p,'utf8');
-        s=s.replace(\"const hostname = process.env.HOSTNAME || '0.0.0.0'\",
-                    \"const hostname = process.env.HOST || '0.0.0.0'\");
-        fs.writeFileSync(p,s);"
-        && node /app/server.js
+      - |
+        echo "🔧 Applying startup patches..."
+
+        # Patch 1: Fix server.js hostname binding
+        node -e "
+        const fs = require('fs');
+        const serverPath = '/app/server.js';
+        let content = fs.readFileSync(serverPath, 'utf8');
+        const original = content;
+        content = content.replace(
+          \"const hostname = process.env.HOSTNAME || '0.0.0.0'\",
+          \"const hostname = process.env.HOST || '0.0.0.0'\"
+        );
+        if (content !== original) {
+          fs.writeFileSync(serverPath, content);
+          console.log('✅ Patched server.js: HOSTNAME -> HOST');
+        } else {
+          console.log('ℹ️  server.js already patched or pattern not found');
+        }
+        "
+
+        # Patch 2: Fix auth callback to use hardcoded origin
+        node -e "
+        const fs = require('fs');
+        const callbackPath = '/app/.next/server/app/auth/callback/route.js';
+        if (fs.existsSync(callbackPath)) {
+          let content = fs.readFileSync(callbackPath, 'utf8');
+          const original = content;
+          // Replace: a.nextUrl.origin || \"https://kortix.darwisyah.com\"
+          // With: \"https://kortix.darwisyah.com\"
+          content = content.replace(
+            /a\.nextUrl\.origin\s*\|\|\s*['\"]https:\/\/kortix\.darwisyah\.com['\"]/g,
+            '\"https://kortix.darwisyah.com\"'
+          );
+          if (content !== original) {
+            fs.writeFileSync(callbackPath, content);
+            console.log('✅ Patched auth callback: forced correct origin');
+          } else {
+            console.log('ℹ️  auth callback already patched or pattern not found');
+          }
+        } else {
+          console.log('⚠️  auth callback file not found at expected path');
+        }
+        "
+
+        echo "🚀 Starting Next.js server..."
+        exec node /app/server.js
 
 volumes:
   redis_data:
