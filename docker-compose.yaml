@@ -62,9 +62,15 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://localhost:8000/v1}
-        NEXT_PUBLIC_URL: ${NEXT_PUBLIC_URL:-http://localhost:3000}
-        NEXT_PUBLIC_ENV_MODE: ${NEXT_PUBLIC_ENV_MODE:-LOCAL}
+        # IMPORTANT: billing endpoints exist under /v1 on your production backend.
+        # Local dev default also corrected to localhost:8001 (matches ports mapping above).
+        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-https://api.kortix.darwisyah.com/v1}
+        # If you want local dev instead, use:
+        # NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://localhost:8001/v1}
+
+        NEXT_PUBLIC_URL: ${NEXT_PUBLIC_URL:-https://kortix.darwisyah.com}
+        NEXT_PUBLIC_ENV_MODE: ${NEXT_PUBLIC_ENV_MODE:-PRODUCTION}
+
     ports:
       - "3000:3000"
     depends_on:
