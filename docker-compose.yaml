@@ -47,14 +47,6 @@ services:
         condition: service_healthy
       worker:
         condition: service_started
-    command:
-      - sh
-      - -c
-      - |
-        echo "Applying backend patches..."
-        sed -i 's/"verify_signature": True/"verify_signature": False/g' /app/core/utils/auth_utils.py 2>/dev/null && echo "Auth patch applied" || echo "Auth patch skipped"
-        echo "Starting backend server..."
-        exec uvicorn api:app --host 0.0.0.0 --port 8000
 
   worker:
     image: ghcr.io/suna-ai/suna-backend:latest
@@ -93,17 +85,7 @@ services:
       - NEXT_PUBLIC_URL=https://kortix.darwisyah.com
       - HOST=0.0.0.0
       - PORT=3000
-    command:
-      - sh
-      - -c
-      - |
-        echo "Applying frontend patches..."
-        sed -i 's/process.env.HOSTNAME/process.env.HOST/g' /app/server.js 2>/dev/null && echo "Server patch applied" || echo "Server patch skipped"
-        if [ -f /app/.next/server/app/auth/callback/route.js ]; then
-          sed -i 's/a.nextUrl.origin/\"https:\/\/kortix.darwisyah.com\"/g' /app/.next/server/app/auth/callback/route.js 2>/dev/null && echo "Auth callback patch applied"
-        fi
-        echo "Starting frontend server..."
-        exec node /app/server.js
+      - HOSTNAME=0.0.0.0
 
 volumes:
   redis_data:
