@@ -47,7 +47,6 @@ services:
         condition: service_healthy
       worker:
         condition: service_started
-    entrypoint: []
     command:
       - sh
       - -c
@@ -94,7 +93,6 @@ services:
       - NEXT_PUBLIC_URL=https://kortix.darwisyah.com
       - HOST=0.0.0.0
       - PORT=3000
-    entrypoint: []
     command:
       - sh
       - -c
