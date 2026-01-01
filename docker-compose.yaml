@@ -47,144 +47,15 @@ services:
         condition: service_healthy
       worker:
         condition: service_started
-    command: >
-      sh -c '
-        echo "🔧 Applying backend patches..."
-        
-        # Patch 1: Disable JWT signature verification (use Supabase API for verification)
-        if grep -q "\"verify_signature\": True" /app/core/utils/auth_utils.py 2>/dev/null; then
-          sed -i "s/\"verify_signature\": True/\"verify_signature\": False/g" /app/core/utils/auth_utils.py
-          echo "✅ Auth patch applied"
-        else
-          echo "ℹ️ Auth already patched or file not found"
-        fi
-        
-        # Patch 2: Add local-mode bypass to trial/start endpoint
-        cat > /tmp/patch_trial.py << '\''PYTHON_PATCH'\''
-import re
-
-file_path = "/app/core/billing/endpoints/trial.py"
-
-try:
-    with open(file_path, "r") as f:
-        content = f.read()
-    
-    # Check if already patched
-    if "LOCAL MODE BYPASS" in content:
-        print("ℹ️ Trial endpoint already patched")
-        exit(0)
-    
-    # Find the imports section and add EnvMode import
-    if "from core.utils.config import config" in content and "EnvMode" not in content:
-        content = content.replace(
-            "from core.utils.config import config",
-            "from core.utils.config import config, EnvMode"
-        )
-    
-    # Find the trial/start endpoint and add local bypass
-    # Look for the POST endpoint pattern
-    start_endpoint_pattern = r'''(@router\.post\(["\x27]/trial/start["\x27].*?\)\s*async def \w+\([^)]*\)[^:]*:)'''
-    
-    match = re.search(start_endpoint_pattern, content, re.DOTALL)
-    if match:
-        # Insert local bypass after the function definition
-        endpoint_def = match.group(1)
-        local_bypass = """
-    # === LOCAL MODE BYPASS ===
-    if config.ENV_MODE == EnvMode.LOCAL:
-        logger.info("[TRIAL] Local mode - bypassing Stripe")
-        return {
-            "success": True,
-            "message": "Trial activated (local mode)",
-            "redirect_url": getattr(request, "success_url", None) or "https://kortix.darwisyah.com/dashboard"
-        }
-    # === END LOCAL MODE BYPASS ===
-"""
-        # Find where to insert (after the docstring if present, or right after def line)
-        insert_pos = content.find(endpoint_def) + len(endpoint_def)
-        # Skip past any docstring
-        remaining = content[insert_pos:]
-        if remaining.lstrip().startswith('\'''\'''\''') or remaining.lstrip().startswith('\''"\''"\''"\'''):
-            # Find end of docstring
-            quote_type = '\'\'\''\'\'\'' if remaining.lstrip().startswith('\'''\'''\''') else '\''"\''"\''"\''
-            first_quote = remaining.find(quote_type)
-            second_quote = remaining.find(quote_type, first_quote + 3)
-            if second_quote != -1:
-                insert_pos = insert_pos + second_quote + 3
-        
-        content = content[:insert_pos] + local_bypass + content[insert_pos:]
-        
-        with open(file_path, "w") as f:
-            f.write(content)
-        print("✅ Trial endpoint patched with local bypass")
-    else:
-        # Fallback: append a complete trial/start endpoint
-        new_endpoint = """
-
-# === LOCAL MODE TRIAL ENDPOINT (AUTO-PATCHED) ===
-from pydantic import BaseModel
-from typing import Optional
-
-class LocalTrialStartRequest(BaseModel):
-    success_url: Optional[str] = None
-    cancel_url: Optional[str] = None
-
-@router.post("/trial/start-local")
-async def start_trial_local(
-    request: LocalTrialStartRequest,
-    account_id: str = Depends(verify_and_get_user_id_from_jwt)
-):
-    \"\"\"Local mode trial activation - bypasses Stripe\"\"\"
-    # LOCAL MODE BYPASS
-    logger.info(f"[TRIAL] Local mode trial start for account {account_id}")
-    return {
-        "success": True,
-        "message": "Trial activated (local mode)",
-        "redirect_url": request.success_url or "https://kortix.darwisyah.com/dashboard"
-    }
-# === END LOCAL MODE TRIAL ENDPOINT ===
-"""
-        content += new_endpoint
-        with open(file_path, "w") as f:
-            f.write(content)
-        print("✅ Added local trial endpoint")
-        
-except Exception as e:
-    print(f"⚠️ Trial patch error: {e}")
-PYTHON_PATCH
-        
-        python3 /tmp/patch_trial.py
-        
-        # Patch 3: Add local bypass to create-checkout endpoint
-        cat > /tmp/patch_checkout.py << '\''CHECKOUT_PATCH'\''
-file_path = "/app/core/billing/endpoints/trial.py"
-
-try:
-    with open(file_path, "r") as f:
-        content = f.read()
-    
-    if "create-checkout" in content and "LOCAL MODE" not in content.split("create-checkout")[1][:500] if "create-checkout" in content else True:
-        # Add bypass to create-checkout if it exists
-        if "@router.post" in content and "create-checkout" in content:
-            content = content.replace(
-                "async def create_checkout_session(",
-                """async def create_checkout_session("""
-            )
-    
-    # Verify the file is valid Python
-    compile(content, file_path, "exec")
-    print("✅ Checkout patch verified")
-except SyntaxError as e:
-    print(f"⚠️ Syntax error in patch: {e}")
-except Exception as e:
-    print(f"ℹ️ Checkout patch note: {e}")
-CHECKOUT_PATCH
-        
-        python3 /tmp/patch_checkout.py
-        
-        echo "🚀 Starting backend server..."
+    entrypoint: []
+    command:
+      - sh
+      - -c
+      - |
+        echo "Applying backend patches..."
+        sed -i 's/"verify_signature": True/"verify_signature": False/g' /app/core/utils/auth_utils.py 2>/dev/null && echo "Auth patch applied" || echo "Auth patch skipped"
+        echo "Starting backend server..."
         exec uvicorn api:app --host 0.0.0.0 --port 8000
-      '
 
   worker:
     image: ghcr.io/suna-ai/suna-backend:latest
@@ -223,26 +94,18 @@ CHECKOUT_PATCH
       - NEXT_PUBLIC_URL=https://kortix.darwisyah.com
       - HOST=0.0.0.0
       - PORT=3000
-    command: >
-      sh -c '
-        echo "🔧 Applying frontend patches..."
-        
-        # Patch 1: Fix server hostname binding
-        if [ -f /app/server.js ]; then
-          sed -i "s/process.env.HOSTNAME || '\''0.0.0.0'\''/process.env.HOST || '\''0.0.0.0'\''/g" /app/server.js
-          echo "✅ Server hostname patch applied"
+    entrypoint: []
+    command:
+      - sh
+      - -c
+      - |
+        echo "Applying frontend patches..."
+        sed -i 's/process.env.HOSTNAME/process.env.HOST/g' /app/server.js 2>/dev/null && echo "Server patch applied" || echo "Server patch skipped"
+        if [ -f /app/.next/server/app/auth/callback/route.js ]; then
+          sed -i 's/a.nextUrl.origin/\"https:\/\/kortix.darwisyah.com\"/g' /app/.next/server/app/auth/callback/route.js 2>/dev/null && echo "Auth callback patch applied"
         fi
-        
-        # Patch 2: Fix auth callback origin
-        AUTH_FILE="/app/.next/server/app/auth/callback/route.js"
-        if [ -f "$AUTH_FILE" ]; then
-          sed -i "s/a.nextUrl.origin || '\''https:\/\/kortix.darwisyah.com'\''/'\''https:\/\/kortix.darwisyah.com'\''/g" "$AUTH_FILE"
-          echo "✅ Auth callback patch applied"
-        fi
-        
-        echo "🚀 Starting frontend server..."
+        echo "Starting frontend server..."
         exec node /app/server.js
-      '
 
 volumes:
   redis_data:
