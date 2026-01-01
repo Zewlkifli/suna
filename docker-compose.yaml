@@ -100,7 +100,7 @@ services:
       - NEXT_PUBLIC_ENV_MODE=LOCAL
     depends_on:
       - backend
-    command: ["sh", "-c", "sed -i 's/a\\.nextUrl\\.origin/\"https:\\/\\/kortix.darwisyah.com\"/g' /app/.next/server/app/auth/callback/route.js 2>/dev/null; exec node /app/server.js"]
+    command: ["sh", "-c", "sed -i 's/a\\.nextUrl\\.origin/\"https:\\/\\/kortix.darwisyah.com\"/g' /app/.next/server/app/auth/callback/route.js 2>/dev/null; sed -i 's/const isLocalMode=.*toLowerCase.*===/const isLocalMode=true||process.env.NEXT_PUBLIC_ENV_MODE?.toLowerCase()===/g' /app/middleware.js 2>/dev/null; sed -i 's/const isLocalMode=process/const isLocalMode=true||process/g' /app/middleware.js 2>/dev/null; exec node /app/server.js"]
 
 volumes:
   redis_data:
