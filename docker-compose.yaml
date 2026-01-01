@@ -49,7 +49,7 @@ services:
         condition: service_healthy
       worker:
         condition: service_started
-    command: ["sh", "-c", "sed -i 's/\"verify_signature\": True/\"verify_signature\": False/g' /app/core/utils/auth_utils.py && echo 'from fastapi import APIRouter, Depends\nfrom typing import Dict\nfrom core.utils.auth_utils import verify_and_get_user_id_from_jwt\n\nrouter = APIRouter(tags=[\"billing-trial\"])\n\n@router.get(\"/trial/status\")\nasync def get_trial_status(account_id: str = Depends(verify_and_get_user_id_from_jwt)) -> Dict:\n    return {\"has_trial\": True, \"trial_status\": \"active\", \"message\": \"Local mode\"}\n\n@router.post(\"/trial/cancel\")\nasync def cancel_trial(account_id: str = Depends(verify_and_get_user_id_from_jwt)) -> Dict:\n    return {\"success\": True, \"message\": \"Local mode\"}\n\n@router.post(\"/trial/start\")\nasync def start_trial(account_id: str = Depends(verify_and_get_user_id_from_jwt)) -> Dict:\n    return {\"success\": True, \"redirect_url\": \"https://kortix.darwisyah.com/dashboard\"}\n\n@router.post(\"/trial/create-checkout\")\nasync def create_checkout(account_id: str = Depends(verify_and_get_user_id_from_jwt)) -> Dict:\n    return {\"success\": True, \"redirect_url\": \"https://kortix.darwisyah.com/dashboard\"}' > /app/core/billing/endpoints/trial.py && exec uv run uvicorn api:app --host 0.0.0.0 --port 8000"]
+    command: ["sh", "-c", "sed -i 's/\"verify_signature\": True/\"verify_signature\": False/g' /app/core/utils/auth_utils.py && printf 'from fastapi import APIRouter, Depends\nfrom typing import Dict\nfrom core.utils.auth_utils import verify_and_get_user_id_from_jwt\n\nrouter = APIRouter(tags=[\"billing-trial\"])\n\n@router.get(\"/trial/status\")\nasync def get_trial_status(account_id: str = Depends(verify_and_get_user_id_from_jwt)) -> Dict:\n    return {\"has_trial\": True, \"trial_status\": \"active\", \"message\": \"Local mode\"}\n\n@router.post(\"/trial/cancel\")\nasync def cancel_trial(account_id: str = Depends(verify_and_get_user_id_from_jwt)) -> Dict:\n    return {\"success\": True, \"message\": \"Local mode\"}\n\n@router.post(\"/trial/start\")\nasync def start_trial(account_id: str = Depends(verify_and_get_user_id_from_jwt)) -> Dict:\n    return {\"success\": True, \"checkout_url\": \"https://kortix.darwisyah.com/dashboard?trial=started\"}\n\n@router.post(\"/trial/create-checkout\")\nasync def create_checkout(account_id: str = Depends(verify_and_get_user_id_from_jwt)) -> Dict:\n    return {\"success\": True, \"checkout_url\": \"https://kortix.darwisyah.com/dashboard?trial=started\"}\n' > /app/core/billing/endpoints/trial.py && exec uv run uvicorn api:app --host 0.0.0.0 --port 8000"]
 
   worker:
     image: ghcr.io/suna-ai/suna-backend:latest
@@ -89,7 +89,7 @@ services:
       - NEXT_PUBLIC_ENV_MODE=LOCAL
     depends_on:
       - backend
-    command: ["sh", "-c", "sed -i 's/a\\.nextUrl\\.origin/\"https:\\/\\/kortix.darwisyah.com\"/g' /app/.next/server/app/auth/callback/route.js 2>/dev/null; sed -i 's/const isLocalMode=process/const isLocalMode=true||process/g' /app/middleware.js 2>/dev/null; exec node /app/server.js"]
+    command: ["sh", "-c", "sed -i 's/a\\.nextUrl\\.origin/\"https:\\/\\/kortix.darwisyah.com\"/g' /app/.next/server/app/auth/callback/route.js 2>/dev/null; exec node /app/server.js"]
 
 volumes:
   redis_data:
