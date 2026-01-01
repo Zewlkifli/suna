@@ -89,7 +89,7 @@ services:
       args:
         NEXT_PUBLIC_BACKEND_URL: https://api.kortix.darwisyah.com/v1
         NEXT_PUBLIC_URL: https://kortix.darwisyah.com
-        NEXT_PUBLIC_ENV_MODE: PRODUCTION
+        NEXT_PUBLIC_ENV_MODE: LOCAL
     ports:
       - "3000:3000"
     environment:
@@ -97,6 +97,7 @@ services:
       - HOST=0.0.0.0
       - NEXTAUTH_URL=https://kortix.darwisyah.com
       - NEXT_PUBLIC_APP_URL=https://kortix.darwisyah.com
+      - NEXT_PUBLIC_ENV_MODE=LOCAL
     depends_on:
       - backend
     command: ["sh", "-c", "sed -i 's/a\\.nextUrl\\.origin/\"https:\\/\\/kortix.darwisyah.com\"/g' /app/.next/server/app/auth/callback/route.js 2>/dev/null; exec node /app/server.js"]
